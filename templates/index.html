@@ -217,6 +217,9 @@
       <div class="nav-item" onclick="showPanel('portfolio')" id="nav-portfolio">
         <span class="icon">💼</span> Portfolio
       </div>
+      <div class="nav-item" onclick="showPanel('trades'); loadTradeHistory();" id="nav-trades">
+        <span class="icon">🗂️</span> Trades
+      </div>
 
       <div style="margin-top:auto; padding-top:12px; border-top:1px solid var(--border);">
         <div class="text-sm" style="padding:6px 10px;">
@@ -356,6 +359,25 @@
           </div>
           <div id="train-loading" class="loading-row hidden" style="margin-top:8px;">
             <div class="spinner"></div> Training… this may take 10–30 seconds
+          </div>
+        </div>
+
+        <!-- Save status banner (shown after training) -->
+        <div id="model-save-banner" style="display:none; margin-bottom:12px;">
+          <div style="display:flex; align-items:center; gap:10px; padding:10px 14px; background:rgba(63,185,80,.1); border:1px solid rgba(63,185,80,.35); border-radius:var(--radius); font-size:13px;">
+            <span style="color:var(--green); font-size:16px;">💾</span>
+            <span>Model auto-saved → <code id="model-save-path" class="mono" style="color:var(--green);"></code></span>
+          </div>
+        </div>
+
+        <!-- Saved Models card -->
+        <div class="card" id="saved-models-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+            <div class="card-title" style="margin-bottom:0;">Saved Models</div>
+            <button class="btn btn-outline" style="padding:4px 10px; font-size:12px;" onclick="refreshModelList()">↺ Refresh</button>
+          </div>
+          <div id="saved-models-list">
+            <div style="color:var(--text2); font-size:13px; padding:6px 0;">No saved models yet — train a model to auto-save it.</div>
           </div>
         </div>
 
@@ -580,6 +602,87 @@
           </div>
         </div>
       </div>
+
+      <!-- ══ TRADES PANEL ══ -->
+      <div class="panel" id="panel-trades">
+
+        <!-- Stats row -->
+        <div class="card">
+          <div class="card-title">Trade Summary</div>
+          <div class="stat-grid" id="trade-stats-grid">
+            <div class="stat-box"><div class="stat-label">Total Trades</div><div class="stat-val" id="ts-total">—</div></div>
+            <div class="stat-box"><div class="stat-label">Buys</div><div class="stat-val up" id="ts-buys">—</div></div>
+            <div class="stat-box"><div class="stat-label">Sells</div><div class="stat-val down" id="ts-sells">—</div></div>
+            <div class="stat-box"><div class="stat-label">Symbols Traded</div><div class="stat-val" id="ts-syms">—</div></div>
+          </div>
+        </div>
+
+        <!-- Charts row -->
+        <div class="card-row">
+          <!-- Activity over time -->
+          <div class="card" style="flex:2; min-width:300px;">
+            <div class="card-title">Trade Activity</div>
+            <canvas id="chart-trade-activity" height="140"></canvas>
+          </div>
+          <!-- Buy vs Sell breakdown -->
+          <div class="card" style="flex:1; min-width:200px;">
+            <div class="card-title">Buy / Sell Split</div>
+            <canvas id="chart-trade-split" height="140"></canvas>
+          </div>
+          <!-- By symbol -->
+          <div class="card" style="flex:1.5; min-width:240px;">
+            <div class="card-title">Trades by Symbol</div>
+            <canvas id="chart-trade-symbol" height="140"></canvas>
+          </div>
+        </div>
+
+        <!-- Filter bar -->
+        <div class="card">
+          <div class="form-row" style="margin-bottom:0;">
+            <div class="form-group">
+              <label>Filter Symbol</label>
+              <input id="th-symbol-filter" class="input-md" type="text" placeholder="All symbols" style="text-transform:uppercase;" oninput="filterTradeTable()"/>
+            </div>
+            <div class="form-group">
+              <label>Action</label>
+              <select id="th-action-filter" onchange="filterTradeTable()">
+                <option value="">All</option>
+                <option value="BUY">BUY</option>
+                <option value="SELL">SELL</option>
+              </select>
+            </div>
+            <button class="btn btn-outline" style="margin-top:auto;" onclick="loadTradeHistory()">↺ Refresh</button>
+          </div>
+        </div>
+
+        <!-- Trade log table -->
+        <div class="card">
+          <div class="card-title">Trade Log</div>
+          <div class="tbl-wrap">
+            <table id="trade-log-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Timestamp (UTC)</th>
+                  <th>Symbol</th>
+                  <th>Action</th>
+                  <th>Qty</th>
+                  <th>Type</th>
+                  <th>Limit</th>
+                  <th>Currency</th>
+                  <th>Status</th>
+                  <th>Order ID</th>
+                  <th style="width:32px;"></th>
+                </tr>
+              </thead>
+              <tbody id="trade-log-tbody">
+                <tr><td colspan="11" style="color:var(--text2); text-align:center;">No trades recorded yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div><!-- /panel-trades -->
 
     </div><!-- /content -->
   </div><!-- /main -->
@@ -997,6 +1100,13 @@ async function trainModel() {
 
   toast(`Model trained! Test accuracy: ${res.test_accuracy}%`, 'success');
 
+  // ── Show auto-save banner ─────────────────────────────────────────
+  if (res.model_saved && res.model_path) {
+    document.getElementById('model-save-path').textContent = res.model_path;
+    document.getElementById('model-save-banner').style.display = 'block';
+    refreshModelList();   // Refresh the saved-models list
+  }
+
   // Render results
   document.getElementById('model-results').style.display = 'block';
 
@@ -1017,6 +1127,61 @@ async function trainModel() {
 
   // Sync backtest symbol
   if (!document.getElementById('bt-symbol').value) document.getElementById('bt-symbol').value = symbol;
+}
+
+/* ── Saved-model list & load ─────────────────────────────────────── */
+async function refreshModelList() {
+  try {
+    const res = await fetch('/api/models', { method: 'GET' }).then(r => r.json());
+    const container = document.getElementById('saved-models-list');
+    if (!res.success || !res.models.length) {
+      container.innerHTML = '<div style="color:var(--text2); font-size:13px; padding:6px 0;">No saved models yet — train a model to auto-save it.</div>';
+      return;
+    }
+    container.innerHTML = `
+      <table style="width:100%; border-collapse:collapse;">
+        <thead>
+          <tr style="color:var(--text2); font-size:11px; text-transform:uppercase; letter-spacing:.4px; border-bottom:1px solid var(--border);">
+            <th style="text-align:left; padding:4px 8px;">Symbol</th>
+            <th style="text-align:left; padding:4px 8px;">File</th>
+            <th style="text-align:right; padding:4px 8px;">Size</th>
+            <th style="text-align:right; padding:4px 8px;">Saved</th>
+            <th style="padding:4px 8px;"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${res.models.map(m => `
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:7px 8px; font-weight:700;">${m.symbol}</td>
+              <td style="padding:7px 8px; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text2);">${m.filename}</td>
+              <td style="padding:7px 8px; text-align:right; color:var(--text2); font-size:12px;">${m.size_kb} KB</td>
+              <td style="padding:7px 8px; text-align:right; color:var(--text2); font-size:12px; white-space:nowrap;">${m.saved_at}</td>
+              <td style="padding:7px 8px; text-align:right;">
+                <button class="btn btn-outline" style="padding:4px 12px; font-size:12px;"
+                  onclick="loadSavedModel('${m.symbol}', '${m.path}')">⬇ Load</button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
+  } catch (err) {
+    console.error('refreshModelList:', err);
+  }
+}
+
+async function loadSavedModel(symbol, path) {
+  try {
+    const res = await api('/api/load-model', { symbol, path });
+    if (res.success) {
+      toast(res.message, 'success');
+      document.getElementById('model-status-badge').textContent = `Model: ${symbol}  (loaded from file)`;
+      document.getElementById('model-status-badge').style.color = 'var(--green)';
+      state.modelTrained = true;
+    } else {
+      toast('Load failed: ' + res.message, 'error');
+    }
+  } catch (err) {
+    toast('Load failed: ' + err.message, 'error');
+  }
 }
 
 function renderPrediction(res) {
@@ -1375,9 +1540,157 @@ function renderCacheBar(res) {
   }
 }
 
+/* ════════════════════════════════════════════════════════════════════
+   TRADE HISTORY
+   ════════════════════════════════════════════════════════════════════ */
+
+let _allTrades = [];  // full trade list for client-side filtering
+
+async function loadTradeHistory() {
+  try {
+    // Load stats + full trade list in parallel
+    const [statsRes, tradesRes] = await Promise.all([
+      fetch('/api/trades/stats').then(r => r.json()),
+      fetch('/api/trades?limit=500', { method: 'GET' }).then(r => r.json()),
+    ]);
+
+    if (statsRes.success) renderTradeStats(statsRes);
+    if (tradesRes.success) {
+      _allTrades = tradesRes.trades || [];
+      filterTradeTable();
+    }
+  } catch (err) {
+    toast('Failed to load trade history: ' + err.message, 'error');
+  }
+}
+
+function renderTradeStats(s) {
+  document.getElementById('ts-total').textContent  = s.total ?? 0;
+  document.getElementById('ts-buys').textContent   = s.buy_count ?? 0;
+  document.getElementById('ts-sells').textContent  = s.sell_count ?? 0;
+  document.getElementById('ts-syms').textContent   = (s.symbols || []).length;
+
+  // ── Activity chart (trades per day) ──────────────────────────────
+  const byDay = s.by_day || [];
+  state.charts['trade-activity'] = mkChart('chart-trade-activity', {
+    type: 'bar',
+    data: {
+      labels: byDay.map(d => d.day),
+      datasets: [{
+        label: 'Trades',
+        data: byDay.map(d => d.count),
+        backgroundColor: 'rgba(31,111,235,0.6)',
+        borderColor: '#1f6feb',
+        borderWidth: 1,
+        borderRadius: 3,
+      }],
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: CJ_LEGEND, tooltip: CJ_TOOLTIP },
+      scales: { x: { ...CJ_SCALE_X, type: 'time', time: { unit: 'day', tooltipFormat: 'yyyy-MM-dd', displayFormats: { day: 'MMM d' } }, grid: { color: '#21262d' }, ticks: { color: '#8b949e', maxRotation: 45 } }, y: { ...CJ_SCALE_Y, beginAtZero: true, ticks: { ...CJ_SCALE_Y.ticks, precision: 0 } } },
+    },
+  });
+
+  // ── Buy / Sell doughnut ───────────────────────────────────────────
+  const buys  = s.buy_count  || 0;
+  const sells = s.sell_count || 0;
+  state.charts['trade-split'] = mkChart('chart-trade-split', {
+    type: 'doughnut',
+    data: {
+      labels: ['BUY', 'SELL'],
+      datasets: [{
+        data: [buys, sells],
+        backgroundColor: ['rgba(63,185,80,0.7)', 'rgba(218,54,51,0.7)'],
+        borderColor: ['#3fb950', '#da3633'],
+        borderWidth: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      cutout: '60%',
+      plugins: { legend: CJ_LEGEND, tooltip: CJ_TOOLTIP },
+    },
+  });
+
+  // ── By symbol bar chart ───────────────────────────────────────────
+  const bySym = (s.by_symbol || []).slice(0, 10);
+  state.charts['trade-symbol'] = mkChart('chart-trade-symbol', {
+    type: 'bar',
+    data: {
+      labels: bySym.map(r => r.symbol),
+      datasets: [
+        { label: 'Buys',  data: bySym.map(r => r.buys  || 0), backgroundColor: 'rgba(63,185,80,0.65)',  borderColor: '#3fb950', borderWidth: 1, borderRadius: 3 },
+        { label: 'Sells', data: bySym.map(r => r.sells || 0), backgroundColor: 'rgba(218,54,51,0.65)', borderColor: '#da3633', borderWidth: 1, borderRadius: 3 },
+      ],
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: CJ_LEGEND, tooltip: CJ_TOOLTIP },
+      scales: { x: { stacked: false, grid: { color: '#21262d' }, ticks: { color: '#8b949e' } }, y: { ...CJ_SCALE_Y, beginAtZero: true, ticks: { ...CJ_SCALE_Y.ticks, precision: 0 } } },
+    },
+  });
+}
+
+function filterTradeTable() {
+  const symFilter    = (document.getElementById('th-symbol-filter').value || '').toUpperCase().trim();
+  const actionFilter = (document.getElementById('th-action-filter').value || '').toUpperCase().trim();
+
+  const filtered = _allTrades.filter(t => {
+    if (symFilter    && !t.symbol.includes(symFilter))    return false;
+    if (actionFilter && t.action !== actionFilter) return false;
+    return true;
+  });
+
+  renderTradeTable(filtered);
+}
+
+function renderTradeTable(trades) {
+  const tbody = document.getElementById('trade-log-tbody');
+  if (!trades.length) {
+    tbody.innerHTML = '<tr><td colspan="11" style="color:var(--text2); text-align:center;">No trades match the filter.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = trades.map(t => {
+    const actionCls = t.action === 'BUY' ? 'up' : 'down';
+    const statusColor = t.status === 'filled' ? 'var(--green)' : t.status === 'rejected' ? 'var(--red)' : 'var(--orange)';
+    const ts = t.timestamp ? t.timestamp.replace('T', ' ').replace('+00:00', '') : '—';
+    return `<tr>
+      <td class="mono">${t.id}</td>
+      <td class="mono" style="white-space:nowrap;">${ts}</td>
+      <td style="font-weight:600;">${t.symbol}</td>
+      <td class="${actionCls}" style="font-weight:700;">${t.action}</td>
+      <td class="mono">${t.quantity}</td>
+      <td>${t.order_type}</td>
+      <td class="mono">${t.limit_price != null ? fmtNum(t.limit_price) : '—'}</td>
+      <td>${t.currency}</td>
+      <td style="color:${statusColor}; font-weight:600; text-transform:capitalize;">${t.status}</td>
+      <td class="mono" style="color:var(--text2);">${t.order_id || '—'}</td>
+      <td><button class="btn btn-danger" style="padding:3px 8px; font-size:11px;" onclick="deleteTrade(${t.id})">✕</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function deleteTrade(id) {
+  if (!confirm(`Delete trade #${id}?`)) return;
+  try {
+    const res = await fetch(`/api/trades/${id}`, { method: 'DELETE' }).then(r => r.json());
+    if (res.success) {
+      toast('Trade deleted', 'info');
+      loadTradeHistory();
+    } else {
+      toast(res.message, 'error');
+    }
+  } catch (err) {
+    toast('Delete failed: ' + err.message, 'error');
+  }
+}
+
 /* ── Init ───────────────────────────────────────────────────────────── */
 pollStatus();
 setInterval(pollStatus, 30_000);  // Poll every 30 s
+refreshModelList();               // Populate saved-models on page load
 
 // Link symbol fields so they stay in sync
 ['inp-symbol'].forEach(id => {

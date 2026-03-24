@@ -6,8 +6,10 @@ Then open: http://localhost:5000
 """
 from __future__ import annotations
 
+import glob
 import json
 import logging
+import os
 import traceback
 
 import numpy as np
@@ -18,6 +20,7 @@ from backtest import Backtest
 from data_cache import get_data, cache_info, clear_cache, list_cached_symbols
 from ibkr_client import IBKRClient
 from ml_model import TradingModel
+import trade_db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +32,16 @@ app.config["JSON_SORT_KEYS"] = False
 ibkr    = IBKRClient()
 model   = TradingModel()
 backtest_engine = Backtest()
+
+# ── Model persistence directory ──────────────────────────────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(_HERE, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+
+def _model_path(symbol: str) -> str:
+    """Return the canonical save path for a symbol's model."""
+    return os.path.join(MODELS_DIR, f"{symbol.upper()}_model.joblib")
 
 
 # ── JSON encoder that handles numpy/pandas types ────────────────────────────
@@ -230,6 +243,12 @@ def train():
                 )
                 result["signal_data"] = sig_records
 
+            # ── Auto-save model to models/{SYMBOL}_model.joblib ───────────
+            save_path = _model_path(symbol)
+            saved = model.save(save_path)
+            result["model_saved"] = saved
+            result["model_path"]  = os.path.relpath(save_path, _HERE) if saved else None
+
         return safe_json(result)
 
     except Exception as e:
@@ -294,7 +313,62 @@ def paper_trade():
         limit_price = data.get("limit_price")
 
         result = ibkr.place_order(symbol, action, quantity, order_type, limit_price, "CAD")
+
+        # ── Persist to trade history regardless of IBKR status ──────────────
+        status   = "filled" if result.get("success") else "rejected"
+        order_id = str(result.get("order_id", "")) or None
+        trade_db.record_trade(
+            symbol=symbol,
+            action=action,
+            quantity=quantity,
+            order_type=order_type,
+            currency="CAD",
+            limit_price=float(limit_price) if limit_price else None,
+            status=status,
+            order_id=order_id,
+        )
+
         return safe_json(result)
+    except Exception as e:
+        return safe_json({"success": False, "message": str(e)})
+
+
+# ============================================================================
+#  ROUTES – Trade History
+# ============================================================================
+
+@app.route("/api/trades", methods=["GET"])
+def get_trades():
+    """Return the trade log (newest first)."""
+    try:
+        symbol = request.args.get("symbol")
+        action = request.args.get("action")
+        limit  = int(request.args.get("limit", 500))
+        offset = int(request.args.get("offset", 0))
+        trades = trade_db.get_trades(symbol=symbol, action=action,
+                                     limit=limit, offset=offset)
+        return safe_json({"success": True, "trades": trades, "count": len(trades)})
+    except Exception as e:
+        return safe_json({"success": False, "message": str(e)})
+
+
+@app.route("/api/trades/stats", methods=["GET"])
+def get_trade_stats():
+    """Return aggregate statistics for the trade history."""
+    try:
+        stats = trade_db.get_trade_stats()
+        return safe_json({"success": True, **stats})
+    except Exception as e:
+        return safe_json({"success": False, "message": str(e)})
+
+
+@app.route("/api/trades/<int:trade_id>", methods=["DELETE"])
+def delete_trade(trade_id: int):
+    """Remove a single trade record by id."""
+    try:
+        removed = trade_db.delete_trade(trade_id)
+        msg = "Trade deleted" if removed else "Trade not found"
+        return safe_json({"success": removed, "message": msg})
     except Exception as e:
         return safe_json({"success": False, "message": str(e)})
 
@@ -312,13 +386,40 @@ def portfolio():
         return safe_json({"success": False, "message": str(e)})
 
 
+@app.route("/api/models", methods=["GET"])
+def list_models():
+    """Return all saved model files in the models/ directory."""
+    try:
+        files = []
+        for fp in sorted(glob.glob(os.path.join(MODELS_DIR, "*_model.joblib"))):
+            stat = os.stat(fp)
+            files.append({
+                "filename": os.path.basename(fp),
+                "path":     os.path.relpath(fp, _HERE),
+                "symbol":   os.path.basename(fp).replace("_model.joblib", ""),
+                "size_kb":  round(stat.st_size / 1024, 1),
+                "saved_at": __import__("datetime").datetime.fromtimestamp(
+                    stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            })
+        return safe_json({"success": True, "models": files})
+    except Exception as e:
+        return safe_json({"success": False, "message": str(e)})
+
+
 @app.route("/api/save-model", methods=["POST"])
 def save_model():
     try:
-        data = request.get_json() or {}
-        path = data.get("path", "trading_model.joblib")
-        ok   = model.save(path)
-        return safe_json({"success": ok, "path": path if ok else None})
+        data   = request.get_json() or {}
+        symbol = data.get("symbol", "").strip().upper()
+        # Allow an explicit path override; otherwise use the canonical per-symbol path
+        path   = data.get("path") or (_model_path(symbol) if symbol else
+                                      os.path.join(MODELS_DIR, "model.joblib"))
+        ok     = model.save(path)
+        return safe_json({
+            "success": ok,
+            "path":    os.path.relpath(path, _HERE) if ok else None,
+            "message": f"Saved to {os.path.relpath(path, _HERE)}" if ok else "No trained model to save",
+        })
     except Exception as e:
         return safe_json({"success": False, "message": str(e)})
 
@@ -326,10 +427,17 @@ def save_model():
 @app.route("/api/load-model", methods=["POST"])
 def load_model():
     try:
-        data = request.get_json() or {}
-        path = data.get("path", "trading_model.joblib")
-        ok   = model.load(path)
-        return safe_json({"success": ok, "message": "Model loaded" if ok else "File not found"})
+        data   = request.get_json() or {}
+        symbol = data.get("symbol", "").strip().upper()
+        # Accept explicit path or look up the canonical per-symbol path
+        path   = data.get("path") or (_model_path(symbol) if symbol else "")
+        if not path:
+            return safe_json({"success": False, "message": "Provide symbol or path"})
+        ok = model.load(path)
+        return safe_json({
+            "success": ok,
+            "message": f"Model loaded from {os.path.relpath(path, _HERE)}" if ok else f"File not found: {path}",
+        })
     except Exception as e:
         return safe_json({"success": False, "message": str(e)})
 
